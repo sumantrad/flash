@@ -6,7 +6,9 @@ git clone ...
 
 ## env. setup
 uv .venv --python <version>
+
 source .venv/bin/activate
+
 uv pip install -r requirements.txt
 
 ## profile kernels
