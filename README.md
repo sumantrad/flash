@@ -1,5 +1,5 @@
 # flash
-flash type attention kernel tuning
+flash type attention kernel tuning on A4000
 
 # clone
 git clone ...
