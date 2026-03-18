@@ -9,27 +9,6 @@ import triton.language as tl
 DEVICE = triton.runtime.driver.active.get_active_torch_device()
 PROFILE = int(os.getenv("PROFILE", 0)) == 1
 
-
-# @triton.autotune(
-#     configs=[
-#         triton.Config(
-#             {
-#                 "BLOCK_M": BM,
-#                 "BLOCK_N": BN,
-#                 "BLOCK_D": BD,
-#             },
-#             num_warps=NW,
-#             num_stages=NS,
-#         )
-#         for BM in [32, 64]
-#         for BN in [32, 64]
-#         for BD in [32, 64]
-#         for NW in [2, 4]
-#         for NS in [2, 3]
-#     ],
-#     key=["S", "D"],  # important: problem size key
-# )
-
 @triton.jit
 def attn_fwd_pass1(
     Q, Kt,            # NOTE: Kt = pre-transposed K
@@ -144,25 +123,6 @@ def attn_fwd_pass1(
     tl.store(m_ptr + offs_m * stride_ms, m_i, mask=mask_m)
     tl.store(l_ptr + offs_m * stride_ls, l_i, mask=mask_m)
 
-# @triton.autotune(
-#     configs=[
-#         triton.Config(
-#             {
-#                 "BLOCK_M": BM,
-#                 "BLOCK_N": BN,
-#                 "BLOCK_D": BD,
-#             },
-#             num_warps=NW,
-#             num_stages=NS,
-#         )
-#         for BM in [64, 128]
-#         for BN in [64, 128]
-#         for BD in [32, 64]
-#         for NW in [4, 8]
-#         for NS in [2, 3, 4]
-#     ],
-#     key=["S", "D"],
-# )
 
 @triton.jit
 def attn_fwd_pass2(
@@ -280,8 +240,9 @@ def attn_fwd_pass2(
         # mixed precision; use MMA cores for dot and Accumulate (fp32)
         # -----------------------------
         p_bf16 = p.to(tl.bfloat16)
+        v_bf16 = v.to(tl.bfloat16)
 
-        acc += tl.dot(p_bf16, v).to(tl.float32)
+        acc += tl.dot(p_bf16, v_bf16).to(tl.float32)
         #acc += tl.dot(p, v)
 
     # -----------------------------
@@ -293,63 +254,57 @@ def attn_fwd_pass2(
         mask=mask_m[:, None] & mask_d[None, :],
     )
 
-def compute_sram_need(Br, Bc, D_h, D_p):
-    device_properties = torch.cuda.get_device_properties(0)
-    q_sram = Br * D_p * 2  
-    k_sram = Bc * D_p * 2  
-    v_sram = Bc * D_p * 2  
-    o_sram = Br * D_p * 2  
-    max_sram_size = device_properties.shared_memory_per_block
-    print(f"Device Name: {device_properties.name}")
-    print(f"Maximum Shared Memory (SRAM) Per Block: {max_sram_size} bytes")
-    print(f"Shared Memory needed: {q_sram + k_sram + v_sram + o_sram} bytes")
+def reference_attention_streaming(q, k, v, block_n=1024):
+    """
+    q: [B, H, S, D]
+    k: [B, H_kv, S, D]
+    v: [B, H_kv, S, D]
+    """
 
-def compute_register_need(Br, Bc, D_h, D_p):
-    q_regs = Br * D_p  
-    k_regs = Bc * D_p
-    v_regs = Bc * D_p 
-    o_regs = Br * D_p 
-    m_registers = Br
-    l_registers = Br
-    total_regs = q_regs + k_regs + v_regs + o_regs + m_registers + l_registers
-    print(f"Registers needed per program: {total_regs} registers")
-    print(f"Registers needed per thread (assuming 4 warps = 128 threads): {total_regs / 128:.2f} registers/thread")
+    B, H, S, D = q.shape
+    H_kv = k.shape[1]
+    scale = 1 / math.sqrt(D)
 
+    o = torch.zeros_like(q, dtype=torch.float32)
 
-def check_tma():
-    # Print PTX to check for mma instructions
-    print("\n=== Checking for Tensor Core (mma) instructions in PTX ===")
-    #############################
-    # Access the compiled kernel from cache
-    import glob
-    import os as os_module
+    for b in range(B):
+        for h in range(H):
+            kv_h = h * H_kv // H  # GQA mapping
 
-    cache_dir = os_module.path.expanduser("~/.triton/cache")
-    ptx_files = glob.glob(f"{cache_dir}/**/*.ptx", recursive=True)
-    if ptx_files:
-        # Get most recent PTX file
-        latest_ptx = max(ptx_files, key=os_module.path.getmtime)
-        with open(latest_ptx, "r") as f:
-            ptx_content = f.read()
-        if "mma" in ptx_content:
-            print("✓ Found mma instructions - Tensor Cores ARE being used!")
-            for line in ptx_content.split("\n"):
-                if "mma" in line:
-                    print(f"  {line.strip()}")
-        else:
-            print("✗ No mma instructions found - Tensor Cores NOT being used")
-            # Look for what dot product instructions are used
-            print("\nLooking for fma/mul instructions:")
-            for line in ptx_content.split("\n"):
-                if "fma" in line.lower() or (
-                    "mul" in line.lower() and "bf16" in line.lower()
-                ):
-                    print(f"  {line.strip()}")
-                    break
-    else:
-        print("No PTX files found in cache")
-    #############################
+            q_bh = q[b, h].float()       # [S, D]
+            k_bh = k[b, kv_h].float()    # [S, D]
+            v_bh = v[b, kv_h].float()    # [S, D]
 
+            # streaming softmax state
+            m = torch.full((S,), -float("inf"), device=q.device)
+            l = torch.zeros((S,), device=q.device)
+            acc = torch.zeros((S, D), device=q.device)
+
+            for start in range(0, S, block_n):
+                end = min(start + block_n, S)
+
+                k_chunk = k_bh[start:end]        # [Bc, D]
+                v_chunk = v_bh[start:end]        # [Bc, D]
+
+                # compute scores
+                scores = (q_bh @ k_chunk.T) * scale  # [S, Bc]
+
+                m_curr = scores.max(dim=1).values
+                p = torch.exp(scores - m_curr[:, None])
+                l_curr = p.sum(dim=1)
+
+                m_new = torch.maximum(m, m_curr)
+
+                alpha = torch.exp(m - m_new)
+                beta = torch.exp(m_curr - m_new)
+
+                acc = alpha[:, None] * acc + beta[:, None] * (p @ v_chunk)
+                l = alpha * l + beta * l_curr
+                m = m_new
+
+            o[b, h] = acc / l[:, None]
+
+    return o
 
 def main():
     B = 1
@@ -387,12 +342,9 @@ def main():
     # Transpose
     k_trans = k.transpose(-1, -2).contiguous()
 
-    compute_sram_need(B_r, B_c, D_h, D_p)
-    compute_register_need(B_r, B_c, D_h, D_p)
+    print("=== calculating abs. diff. b/w Triton Kernel and CPU version ===")
 
-    print("=== profiling flash attention ===")
-
-    # Grid: (Number of Q blocks, Batch * Heads, Number of Dp blocks)
+    # Grid
     grid_tune = lambda meta: (
     triton.cdiv(S, meta["BLOCK_M"]),
     B * N_h,
@@ -403,56 +355,7 @@ def main():
     B * N_h
     )
 
-
-    #warmup
-    for _ in range(2):
-
-        attn_fwd_pass1[grid_fixed](
-            q, k_trans,
-            M, L,
-            q.stride(0), q.stride(1), q.stride(2), q.stride(3),
-            k.stride(0), k.stride(1), k.stride(2), k.stride(3),
-            M.stride(0), M.stride(1), M.stride(2),
-            L.stride(0), L.stride(1), L.stride(2),
-            S,
-            D_h,
-            1/math.sqrt(D_h),
-            N_h,   # number of query heads
-            G,    # group size
-            B_r,
-            B_c,
-            D_p,
-            num_warps = WARP_COUNT,
-            num_stages = PIPELINE_DEPTH,
-            num_ctas = 1,
-            maxnreg = None
-            )
-        attn_fwd_pass2[grid_fixed](
-            q, k_trans, v, o,
-            M, L,
-            q.stride(0), q.stride(1), q.stride(2), q.stride(3),
-            k.stride(0), k.stride(1), k.stride(2), k.stride(3),
-            v.stride(0), v.stride(1), v.stride(2), v.stride(3),
-            o.stride(0), o.stride(1), o.stride(2), o.stride(3),
-            M.stride(0), M.stride(1), M.stride(2),
-            L.stride(0), L.stride(1), L.stride(2),
-            S,
-            D_h,
-            1/math.sqrt(D_h),
-            N_h,   # number of query heads
-            G,    # group size
-            B_r2,
-            B_c2,
-            D_p2,
-            num_warps = WARP_COUNT2,
-            num_stages = PIPELINE_DEPTH2,
-            num_ctas = 1,
-            maxnreg = None
-        )
-    torch.cuda.synchronize()
-
-    #actual profiling
-    attn_fwd_pass1[grid_fixed](
+    attn_fwd_pass1[grid_tune](
         q, k_trans,
         M, L,
         q.stride(0), q.stride(1), q.stride(2), q.stride(3),
@@ -494,10 +397,18 @@ def main():
         num_ctas = 1,
         maxnreg = None
     )
-    check_tma()
-    #BLOCK_M: 64, BLOCK_N: 32, BLOCK_D: 32, num_warps: 2, num_ctas: 1, num_stages: 2, maxnreg: None
-    #BLOCK_M: 64, BLOCK_N: 64, BLOCK_D: 32, num_warps: 4, num_ctas: 1, num_stages: 2, maxnreg: None
+    
     torch.cuda.synchronize()
+
+    q_ref = q.float()
+    k_ref = k.float()
+    v_ref = v.float()
+
+    o_ref = reference_attention_streaming(q_ref, k_ref, v_ref, block_n=1024)
+    o_triton = o
+
+    abs_err = (o_triton - o_ref).abs()
+    print("max abs:", abs_err.max().item())
 
 
 if __name__ == "__main__":
