@@ -22,4 +22,13 @@ chmod +x ncu_profile.sh
 run:
 ./ncu_profile.sh
 
+## best version: Kernel_5
+
+Tuning is done on A4000. To tune on your system -
+
+1. please run 'python kernel_5_attention1_tune.py' to get the best configuration for attention kernel 1
+2. please run 'python kernel_5_attention2_tune.py' to get the best configuration for attention_kernel_2
+3. now profile them jointly by using 'kernel_5.py' (./ncu_profile.sh)
+4. accuracy check using 'kernel_5_accuracy.py'
+
 
